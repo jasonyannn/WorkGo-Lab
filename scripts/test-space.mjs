@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {readFileSync,readdirSync} from 'node:fs';
+import ts from 'typescript';
+const sql=new DatabaseSync(':memory:');sql.exec('PRAGMA foreign_keys=ON');
+for(const file of readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(readFileSync('drizzle/'+file,'utf8'));
+const db={prepare(query){let values=[];return {bind(...v){values=v;return this},async first(){return sql.prepare(query).get(...values)||null},async all(){return {results:sql.prepare(query).all(...values)}},async run(){const r=sql.prepare(query).run(...values);return {meta:{changes:Number(r.changes)}}}}},async batch(statements){sql.exec('BEGIN');try{const r=[];for(const s of statements)r.push(await s.run());sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};
+const bytes=new Map();const bucket={async put(id,stream){bytes.set(id,await new Response(stream).arrayBuffer())},async get(id){return bytes.has(id)?{body:bytes.get(id)}:null},async delete(id){bytes.delete(id)}};
+let user=null;
+const source=readFileSync('app/api/space/route.ts','utf8').replace(/^import .*;\n/gm,'');
+const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+const exports={};new Function('exports','env','getChatGPTUser',compiled)(exports,{DB:db,BUCKET:bucket},async()=>user);
+const as=email=>user={userId:email,displayName:email,email,fullName:null};
+async function get(path='',status=200){const r=await exports.GET(new Request('https://sango.test/api/space'+path));assert.equal(r.status,status);return r.json()}
+async function post(body,status=200){const form=body instanceof FormData;const r=await exports.POST(new Request('https://sango.test/api/space',{method:'POST',headers:{Origin:'https://sango.test',...(!form?{'Content-Type':'application/json'}:{})},body:form?body:JSON.stringify(body)}));const v=await r.json();assert.equal(r.status,status,JSON.stringify(v));return v}
+await get('',401);as('owner@example.com');assert.equal((await get()).needsSetup,true);
+await post({action:'register',name:'Owner'});assert.equal((await get()).workspaces.length,0);
+const {id:space}=await post({action:'createWorkspace',name:'Test space',visibility:'team'});
+const {id:doc}=await post({action:'createDocument',workspaceId:space,title:'Notes'});
+assert.equal((await get()).workspaces[0].role,'owner');
+await post({action:'invite',id:space,email:'member@example.com',role:'member'});
+await post({action:'invite',id:space,email:'admin@example.com',role:'admin'});
+as('stranger@example.com');await post({action:'register',name:'Stranger'});assert.equal((await get()).workspaces.length,0);await get('?id='+doc,404);await post({action:'invite',id:space,email:'bad@example.com'},404);
+as('member@example.com');await post({action:'register',name:'Member'});assert.equal((await get()).workspaces.length,1);await post({action:'invite',id:space,email:'bad@example.com'},403);
+await post({action:'addBlock',id:doc});let detail=await get('?id='+doc);let block=detail.blocks[0];await post({action:'saveBlock',blockId:block.id,version:block.version,kind:'heading',content:'A durable heading'});await post({action:'saveBlock',blockId:block.id,version:block.version,content:'stale'},409);
+for(let i=0;i<105;i++)await post({action:'addBlock',id:doc});assert.equal((await get('?id='+doc)).blocks.length,106);
+const upload=new FormData();upload.set('documentId',doc);upload.set('file',new File(['%PDF-1.7 test'],'test.pdf',{type:'application/pdf'}));const {id:file}=await post(upload);
+const downloaded=await exports.GET(new Request('https://sango.test/api/space?file='+file));assert.equal(await downloaded.text(),'%PDF-1.7 test');assert.match(downloaded.headers.get('Content-Disposition'),/attachment/);
+const binary=new FormData();binary.set('documentId',doc);binary.set('file',new File([new Uint8Array([0,255,37,12])],'custom.unknown'));await post(binary);
+as('owner@example.com');await post({action:'shareDocument',id:doc,email:'member@example.com',role:'viewer'});
+as('member@example.com');await post({action:'addBlock',id:doc},403);await post(upload,403);
+as('admin@example.com');await post({action:'register',name:'Admin'});await post({action:'invite',id:space,email:'another@example.com',role:'member'});await post({action:'shareWorkspace',id:space,email:'owner@example.com',remove:true},400);await post({action:'shareWorkspace',id:space,email:'member@example.com',remove:true});
+as('member@example.com');assert.equal((await get()).workspaces.length,0);await get('?id='+doc,404);await get('?file='+file,404);await post({action:'saveBlock',blockId:block.id,version:2,content:'forbidden'},404);
+as('owner@example.com');detail=await get('?id='+doc);assert.equal(detail.blocks[0].content,'A durable heading');assert.equal(detail.files.length,2);
+const badOrigin=await exports.POST(new Request('https://sango.test/api/space',{method:'POST',headers:{Origin:'https://other.test','Content-Type':'application/json'},body:JSON.stringify({action:'createWorkspace',name:'Bad'})}));assert.equal(badOrigin.status,403);
+console.log('PASS: migrations, account setup, space isolation, owner/admin/member permissions, removal, viewer permissions, 106 persisted blocks, stale-save conflict, PDF and arbitrary binary round trips, and origin enforcement.');
