@@ -15,6 +15,27 @@
       "when": 1790226554791,
       "tag": "0001_broken_alex_wilder",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790261984033,
+      "tag": "0002_red_cerebro",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790308656181,
+      "tag": "0003_hesitant_roland_deschain",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790308792233,
+      "tag": "0004_salty_the_anarchist",
+      "breakpoints": true
     }
   ]
 }

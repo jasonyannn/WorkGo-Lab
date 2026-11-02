@@ -1,0 +1,1 @@
+ALTER TABLE `documents` ADD `icon` text DEFAULT '' NOT NULL;
