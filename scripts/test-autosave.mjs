@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import ts from 'typescript';
+const source=ts.transpileModule(readFileSync('lib/save-queue.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+const exported={};new Function('exports',source)(exported);
+const {createSaveQueue}=exported;
+let finish;const writes=[];
+const queue=createSaveQueue({text:'initial'},1,async(value,version)=>{writes.push([value.text,version]);if(writes.length===1)await new Promise(resolve=>{finish=resolve});return version+1});
+queue.update({text:'first'});const saving=queue.flush();queue.update({text:'latest'});assert.equal(queue.flush(),saving);finish();await saving;assert.deepEqual(writes,[['first',1],['latest',2]]);assert.equal(queue.getState().pending,false);
+let failing=true;const attempts=[];
+const retry=createSaveQueue('old',4,async(value,version)=>{attempts.push([value,version]);if(failing)throw Error('Offline');return version+1});retry.update('draft');await assert.rejects(retry.flush(),/Offline/);assert.equal(retry.getState().pending,true);retry.update('newer draft');failing=false;await retry.flush();assert.deepEqual(attempts,[['draft',4],['newer draft',4]]);assert.equal(retry.getState().error,'');
+queue.dispose();retry.dispose();console.log('PASS: serialized saves, typing during slow requests, flush coordination, preserved drafts after failures, and retry revision handling.');
