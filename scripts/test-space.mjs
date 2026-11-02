@@ -34,3 +34,84 @@ as('member@example.com');assert.equal((await get()).workspaces.length,0);await g
 as('owner@example.com');detail=await get('?id='+doc);assert.equal(detail.blocks[0].content,'A durable heading');assert.equal(detail.files.length,2);
 const badOrigin=await exports.POST(new Request('https://sango.test/api/space',{method:'POST',headers:{Origin:'https://other.test','Content-Type':'application/json'},body:JSON.stringify({action:'createWorkspace',name:'Bad'})}));assert.equal(badOrigin.status,403);
 console.log('PASS: migrations, account setup, space isolation, owner/admin/member permissions, removal, viewer permissions, 106 persisted blocks, stale-save conflict, PDF and arbitrary binary round trips, and origin enforcement.');
+// Nested pages inherit every ancestor's access restrictions.
+as('owner@example.com');
+const {id:parent}=await post({action:'createDocument',workspaceId:space,title:'Private parent',restricted:true});
+const {id:child}=await post({action:'createDocument',workspaceId:space,parentId:parent,title:'Child'});
+const {id:grandchild}=await post({action:'createDocument',workspaceId:space,parentId:child,title:'Grandchild'});
+assert.equal((await get('?id='+grandchild)).ancestors.length,2);
+assert.equal((await get('?id='+parent)).children[0].id,child);
+as('admin@example.com');await get('?id='+child,404);assert.equal((await get()).documents.some(d=>d.id===child||d.id===grandchild),false);
+as('owner@example.com');await post({action:'shareDocument',id:parent,email:'admin@example.com',role:'viewer'});
+as('admin@example.com');assert.equal((await get('?id='+grandchild)).canEdit,false);await post({action:'createDocument',workspaceId:space,parentId:child,title:'Denied'},403);
+as('owner@example.com');await post({action:'shareDocument',id:parent,email:'admin@example.com',role:'editor'});
+as('admin@example.com');const inherited=await post({action:'createDocument',workspaceId:space,parentId:child,title:'Allowed'});assert.ok(inherited.id);
+const {id:other}=await post({action:'createWorkspace',name:'Other space'});await post({action:'createDocument',workspaceId:other,parentId:child,title:'Wrong workspace'},400);
+as('owner@example.com');await post({action:'shareDocument',id:parent,email:'admin@example.com',remove:true});
+as('admin@example.com');await get('?id='+inherited.id,404);
+console.log('PASS: nested-page hierarchy, ancestor permissions, descendant listing privacy, viewer restrictions, and workspace boundaries.');
+// Deletion is owner-only, protects nested pages, and removes dependent records.
+as('stranger@example.com');await post({action:'deleteDocument',id:doc},404);
+as('admin@example.com');await post({action:'deleteDocument',id:doc},403);
+as('owner@example.com');await post({action:'deleteDocument',id:parent},409);
+assert.ok(await get('?id='+child));
+await post({action:'comment',id:doc,body:'Deletion test comment'});
+const beforeDelete=await get('?id='+doc);
+await post({action:'saveDocument',id:doc,version:beforeDelete.version,title:'Deletion fixture',content:'Version test',status:'Draft'});
+const revisionId=(await get('?id='+doc)).history[0].id;
+await post({action:'deleteDocument',id:doc});
+await get('?id='+doc,404);await get('?file='+file,404);await get('?revision='+revisionId,404);
+assert.equal((await get()).documents.some(d=>d.id===doc),false);
+for(const table of ['attachments','collaborators','comments','revisions','blocks'])assert.equal(sql.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE document_id=?`).get(doc).n,0);
+assert.equal(bytes.size,0);
+await post({action:'deleteDocument',id:doc},404);
+console.log('PASS: owner-only deletion, nested-page protection, list removal, dependent-record cleanup, attachment cleanup, and deleted resource access.');
+// Page icons persist independently of document text and respect edit access.
+as('owner@example.com');
+await post({action:'setDocumentIcon',id:child,icon:'🧪'});
+assert.equal((await get('?id='+child)).icon,'🧪');
+assert.equal((await get('?id='+parent)).children.find(d=>d.id===child).icon,'🧪');
+assert.equal((await get()).documents.find(d=>d.id===child).icon,'🧪');
+await post({action:'setDocumentIcon',id:child,icon:'👩🏽‍💻'});
+await post({action:'setDocumentIcon',id:child,icon:'not an emoji'},400);
+await post({action:'setDocumentIcon',id:child,icon:'🧪🚀'},400);
+await post({action:'shareDocument',id:parent,email:'admin@example.com',role:'viewer'});
+as('admin@example.com');await post({action:'setDocumentIcon',id:child,icon:'🚀'},403);
+as('stranger@example.com');await post({action:'setDocumentIcon',id:child,icon:'🚀'},404);
+as('owner@example.com');await post({action:'setDocumentIcon',id:child,icon:''});assert.equal((await get('?id='+child)).icon,'');
+console.log('PASS: page icon persistence, list and nested-page icons, combined emoji, validation, removal, and access checks.');
+// Space settings and protected images.
+as('owner@example.com');
+await post({action:'updateWorkspace',id:space,name:'Renamed space',description:'Updated description'});
+assert.equal((await get()).workspaces.find(w=>w.id===space).name,'Renamed space');
+await post({action:'updateWorkspace',id:space,name:'  ',description:''},400);
+await post({action:'invite',id:space,email:'member@example.com',role:'member'});
+as('member@example.com');await post({action:'updateWorkspace',id:space,name:'Denied',description:''},403);
+as('admin@example.com');await post({action:'updateWorkspace',id:space,name:'Team space',description:'Admin update'});
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aTioAAAAASUVORK5CYII=','base64');
+function imageForm(data=png,type='image/png'){const form=new FormData();form.set('action','workspaceImage');form.set('workspaceId',space);form.set('file',new File([data],'space.png',{type}));return form}
+await post(imageForm());let imageKey=(await get()).workspaces.find(w=>w.id===space).image_id;assert.ok(bytes.has(imageKey));
+const response=await exports.GET(new Request('https://sango.test/api/space?workspaceImage='+space));assert.equal(response.status,200);assert.equal(response.headers.get('Content-Type'),'image/png');assert.deepEqual(Buffer.from(await response.arrayBuffer()),png);
+await post(imageForm());assert.equal(bytes.has(imageKey),false);imageKey=(await get()).workspaces.find(w=>w.id===space).image_id;
+await post(imageForm(Buffer.from('<svg onload="alert(1)"></svg>')),400);
+await post(imageForm(new Uint8Array(5*1024*1024+1)),400);
+as('member@example.com');await post(imageForm(),403);await post({action:'removeWorkspaceImage',id:space},403);
+as('stranger@example.com');await get('?workspaceImage='+space,404);await post(imageForm(),404);
+as('owner@example.com');await post({action:'removeWorkspaceImage',id:space});assert.equal(bytes.has(imageKey),false);await get('?workspaceImage='+space,404);
+console.log('PASS: space renaming, admin/member permissions, private image upload and retrieval, replacement cleanup, removal, size limits, and signature validation.');
+// Structured page blocks retain task status and use version checks.
+for(const kind of ['kanban','checklist']){
+ const {id:bid}=await post({action:'addBlock',id:child,kind});
+ const initial=(await get('?id='+child)).blocks.find(b=>b.id===bid);assert.equal(initial.kind,kind);assert.deepEqual(JSON.parse(initial.content).tasks,[]);
+ const taskData={title:'Launch tasks',tasks:[{id:'task-1',title:'Research',status:'todo'},{id:'task-2',title:'Build',status:'doing'},{id:'task-3',title:'Review',status:'done'}]};
+ await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify(taskData),version:1});
+ taskData.tasks[0].status='done';await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify(taskData),version:2});
+ assert.deepEqual(JSON.parse((await get('?id='+child)).blocks.find(b=>b.id===bid).content),taskData);
+ await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify(taskData),version:2},409);
+ await post({action:'saveBlock',blockId:bid,kind,content:'{"tasks":null}',version:3},400);
+ await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify({title:'Bad',tasks:[{id:'x',title:'Bad',status:'other'}]}),version:3},400);
+ await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify({title:'Bad',tasks:[taskData.tasks[0],taskData.tasks[0]]}),version:3},400);
+ as('admin@example.com');await post({action:'addBlock',id:child,kind},403);await post({action:'saveBlock',blockId:bid,kind,content:JSON.stringify(taskData),version:3},403);await post({action:'deleteBlock',blockId:bid},403);
+ as('owner@example.com');await post({action:'deleteBlock',blockId:bid});assert.equal((await get('?id='+child)).blocks.some(b=>b.id===bid),false);
+}
+console.log('PASS: boards and checklists, task status persistence, stale saves, malformed data, duplicate task IDs, viewer restrictions, and block removal.');
